@@ -33,6 +33,8 @@ platforms:
   - name: ubuntu-13.04
   - name: centos-6.4
   - name: debian-7.1.0
+  - name: windows-2008R2
+  - name: windows-2012R2
 ```
 
 This will effectively generate a configuration similar to:
@@ -178,6 +180,18 @@ The default will be determined by the Platform name, if a default exists (see
 [amis.json][amis_json]). If a default cannot be computed, then the default is
 `"root"`.
 
+### <a name="config-guest"></a> guest
+
+The `guest` parameter MUST be set to tell test-kitchen that it
+has to communicate using the WinRM protocol.
+
+Windows Instance:
+```yaml
+  - name: windows-2008R2
+    driver:
+      guest: :windows
+```
+
 ### <a name="config-iam-profile-name"></a> iam\_profile\_name
 
 The EC2 IAM profile name to use.
@@ -213,6 +227,12 @@ platforms:
     driver:
       image_id: ami-ef5ff086
       username: ec2-user
+  - name: windows-20012R2
+    driver:
+      image_id: ami-0a9c7462
+      username: ec2-username
+      password: ec2-password
+      guest: :windows
 
 suites:
 # ...
@@ -243,6 +263,12 @@ platforms:
     driver:
       image_id: ami-ef5ff086
       username: ec2-user
+  - name: windows-20012R2
+    driver:
+      image_id: ami-0a9c7462
+      username: ec2-username
+      password: ec2-password
+      guest: :windows
 
 suites:
 # ...

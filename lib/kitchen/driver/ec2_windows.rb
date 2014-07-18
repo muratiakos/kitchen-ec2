@@ -46,15 +46,19 @@ module Kitchen
       default_config :aws_session_token do |driver|
         ENV['AWS_SESSION_TOKEN'] || ENV['AWS_TOKEN']
       end
-      default_config :aws_ssh_key_id do |driver|
-        ENV['AWS_SSH_KEY_ID']
-      end
+
       default_config :image_id do |driver|
         driver.default_ami
       end
+   
       default_config :username do |driver|
         driver.default_username
       end
+   
+      default_config :password do |driver|
+        driver.default_password
+      end
+   
       default_config :endpoint do |driver|
         "https://ec2.#{driver[:region]}.amazonaws.com/"
       end
@@ -63,20 +67,21 @@ module Kitchen
 
       required_config :aws_access_key_id
       required_config :aws_secret_access_key
-      required_config :aws_ssh_key_id
       required_config :image_id
 
       def create(state)
         return if state[:server_id]
         server = create_server
         state[:server_id] = server.id
+        state[:password]  = config[:password]
 
         info("EC2 instance <#{state[:server_id]}> created.")
         server.wait_for { print '.'; ready? }
-        print '(server ready)'
+        print ' '
+        info '[Server] Ready.'
         state[:hostname] = hostname(server)
-        wait_for_sshd(state[:hostname], config[:username])
-        print '(ssh ready)\n'
+        wait_for_winrm(state[:hostname], config[:username], state)
+        info '[WinRM] Ready.'
         debug("ec2:create '#{state[:hostname]}'")
       rescue Fog::Errors::Error, Excon::Errors::Error => ex
         raise ActionFailed, ex.message
@@ -98,7 +103,11 @@ module Kitchen
       end
 
       def default_username
-        amis['usernames'][instance.platform.name] || 'root'
+        amis['usernames'][instance.platform.name] || 'Administrator'
+      end
+
+      def default_password
+        'chef'
       end
 
       private
@@ -124,9 +133,9 @@ module Kitchen
           :flavor_id                 => config[:flavor_id],
           :ebs_optimized             => config[:ebs_optimized],
           :image_id                  => config[:image_id],
-          :key_name                  => config[:aws_ssh_key_id],
           :subnet_id                 => config[:subnet_id],
           :iam_instance_profile_name => config[:iam_profile_name],
+          :user_data                 => winrm_config
         )
       end
 
@@ -138,7 +147,6 @@ module Kitchen
         debug("ec2:image_id '#{config[:image_id]}'")
         debug("ec2:security_group_ids '#{config[:security_group_ids]}'")
         debug("ec2:tags '#{config[:tags]}'")
-        debug("ec2:key_name '#{config[:aws_ssh_key_id]}'")
         debug("ec2:subnet_id '#{config[:subnet_id]}'")
         debug("ec2:iam_profile_name '#{config[:iam_profile_name]}'")
       end
@@ -157,6 +165,33 @@ module Kitchen
           'public' => 'public_ip_address',
           'private' => 'private_ip_address'
         }
+      end
+
+      def winrm_config
+        <<-EOH.gsub(/^ {10}/, '')
+        <powershell>
+          $username="#{config[:username]}"
+          $password="#{config[:password]}"
+
+          $seccfg = [IO.Path]::GetTempFileName()
+          secedit /export /cfg $seccfg
+          (Get-Content $seccfg) | Foreach-Object {$_ -replace "PasswordComplexity\\s*=\\s*1", "PasswordComplexity=0"} | Set-Content $seccfg
+          secedit /configure /db $env:windir\\security\\new.sdb /cfg $seccfg /areas SECURITYPOLICY
+          del $seccfg
+           
+          net user /add $username $password;
+          net localgroup Administrators /add $username;
+
+          try { winrm quickconfig -q }
+          catch {write-host "winrm quickconfig failed"}
+          winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="512"}'
+          winrm set winrm/config '@{MaxTimeoutms="1800000"}'
+          winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+          winrm set winrm/config/service/auth '@{Basic="true"}'
+          netsh advfirewall firewall set rule name="Windows Remote Management (HTTP-In)" profile=public protocol=tcp localport=5985 remoteip=localsubnet new remoteip=any
+
+        </powershell>
+        EOH
       end
 
       def hostname(server)
