@@ -55,6 +55,9 @@ module Kitchen
       default_config :username do |driver|
         driver.default_username
       end
+      default_config :password do |driver|
+        driver.default_password
+      end
       default_config :endpoint do |driver|
         "https://ec2.#{driver[:region]}.amazonaws.com/"
       end
@@ -68,15 +71,23 @@ module Kitchen
 
       def create(state)
         return if state[:server_id]
+        state[:port] = default_port
+        state[:password] = config[:password] if config[:password]
+        state[:username] = config[:username] if config[:username]
+
         server = create_server
         state[:server_id] = server.id
 
         info("EC2 instance <#{state[:server_id]}> created.")
         server.wait_for { print '.'; ready? }
-        print '(server ready)'
+        print '(Server Ready)'
         state[:hostname] = hostname(server)
-        wait_for_sshd(state[:hostname], config[:username])
-        print '(ssh ready)\n'
+
+        transport.connection(state) do |c|
+          c.wait_for_connection
+        end
+
+        print '(Transport Ready)'
         debug("ec2:create '#{state[:hostname]}'")
       rescue Fog::Errors::Error, Excon::Errors::Error => ex
         raise ActionFailed, ex.message
@@ -99,6 +110,10 @@ module Kitchen
 
       def default_username
         amis['usernames'][instance.platform.name] || 'root'
+      end
+
+      def default_password
+        amis['passwords'][instance.platform.name]
       end
 
       private
@@ -127,7 +142,37 @@ module Kitchen
           :key_name                  => config[:aws_ssh_key_id],
           :subnet_id                 => config[:subnet_id],
           :iam_instance_profile_name => config[:iam_profile_name],
+          :user_data                 => winrm_config
         )
+      end
+
+      def winrm_config
+        return if config[:password].nil?
+        <<-EOH.gsub(/^ {10}/, '')
+        <powershell>
+          $username="#{config[:username]}"
+          $password="#{config[:password]}"
+
+          $seccfg = [IO.Path]::GetTempFileName()
+          secedit /export /cfg $seccfg
+          (Get-Content $seccfg) | Foreach-Object {$_ -replace "PasswordComplexity\\s*=\\s*1", "PasswordComplexity=0"} | Set-Content $seccfg
+          secedit /configure /db $env:windir\\security\\new.sdb /cfg $seccfg /areas SECURITYPOLICY
+          del $seccfg
+           
+          net user /add $username $password;
+          net localgroup Administrators /add $username;
+
+          try { winrm quickconfig -q }
+          catch {write-host "winrm quickconfig failed"}
+          winrm set winrm/config '@{MaxTimeoutms="1800000"}'
+          winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="512"}'
+          winrm set winrm/config/winrs '@{MaxShellsPerUser="50"}'
+          winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+          winrm set winrm/config/service/auth '@{Basic="true"}'
+          netsh advfirewall firewall set rule name="Windows Remote Management (HTTP-In)" profile=public protocol=tcp localport=5985 remoteip=localsubnet new remoteip=any
+
+        </powershell>
+        EOH
       end
 
       def debug_server_config
@@ -141,6 +186,7 @@ module Kitchen
         debug("ec2:key_name '#{config[:aws_ssh_key_id]}'")
         debug("ec2:subnet_id '#{config[:subnet_id]}'")
         debug("ec2:iam_profile_name '#{config[:iam_profile_name]}'")
+        debug("ec2:user_data '#{winrm_config}'")
       end
 
       def amis
