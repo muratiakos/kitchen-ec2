@@ -25,7 +25,8 @@ module Kitchen
 
   module Driver
 
-    # Amazon EC2 driver for Test Kitchen.
+    # Amazon EC2 driver for Test Kitchen with native
+    # AWS generated Windows password support
     #
     # @author Fletcher Nichol <fnichol@nichol.ca>
     class Ec2 < Kitchen::Driver::Base
@@ -55,9 +56,8 @@ module Kitchen
       default_config :username do |driver|
         driver.default_username
       end
-      default_config :password do |driver|
-        driver.default_password
-      end
+      default_config :password, ''
+
       default_config :endpoint do |driver|
         "https://ec2.#{driver[:region]}.amazonaws.com/"
       end
@@ -69,6 +69,7 @@ module Kitchen
       required_config :aws_ssh_key_id
       required_config :image_id
 
+      #Creating a new instance
       def create(state)
         return if state[:server_id]
         state[:port] = default_port
@@ -79,20 +80,47 @@ module Kitchen
         state[:server_id] = server.id
 
         info("EC2 instance <#{state[:server_id]}> created.")
+
+        #Server preparation
+        debug('Waiting for Server')
         server.wait_for { print '.'; ready? }
         print '(Server Ready)'
         state[:hostname] = hostname(server)
 
+        #Windows preparartion
+        if transport.name.casecmp('winrm') == 0
+          debug("Waiting for Windows")
+          $stdout.sync = true
+          while !windows_ready?(state)
+            putc '.'
+            sleep(10)
+          end
+          print '(Windows Ready)'
+
+          #If we want to use the EC2 generated Admin password
+          if config[:username].casecmp('Administrator') != 0
+            print("Using static credentials")
+          else
+            print('Fetching EC2 generated credentials')
+            config[:password] = windows_password(state)
+            state[:password] = config[:password]
+          end
+        end
+        debug("Credentials: #{state[:username]} #{state[:password]}")
+
+        debug("Waiting for transport")
         transport.connection(state) do |c|
           c.wait_for_connection
         end
-
         print '(Transport Ready)'
+
+
         debug("ec2:create '#{state[:hostname]}'")
       rescue Fog::Errors::Error, Excon::Errors::Error => ex
         raise ActionFailed, ex.message
       end
 
+      #Terminating the test instance
       def destroy(state)
         return if state[:server_id].nil?
 
@@ -103,79 +131,148 @@ module Kitchen
         state.delete(:hostname)
       end
 
+      # Helper method to map a regial AMI for the OS
       def default_ami
         region = amis['regions'][config[:region]]
-        region && region[instance.platform.name]
+        region && region[instance.platform.name.downcase]
       end
 
+      # Helper method to choose the admin user for the OS
       def default_username
-        amis['usernames'][instance.platform.name] || 'root'
-      end
-
-      def default_password
-        amis['passwords'][instance.platform.name]
+        amis['usernames'][instance.platform.name.downcase] || 'root'
       end
 
       private
 
+      # Fog AWS helper method for creating connection
       def connection
         Fog::Compute.new(
-          :provider               => :aws,
-          :aws_access_key_id      => config[:aws_access_key_id],
-          :aws_secret_access_key  => config[:aws_secret_access_key],
-          :aws_session_token      => config[:aws_session_token],
-          :region                 => config[:region],
-          :endpoint               => config[:endpoint],
+        :provider               => :aws,
+        :aws_access_key_id      => config[:aws_access_key_id],
+        :aws_secret_access_key  => config[:aws_secret_access_key],
+        :aws_session_token      => config[:aws_session_token],
+        :region                 => config[:region],
+        :endpoint               => config[:endpoint],
         )
       end
 
+      # Fog AWS helper for creating the instance
       def create_server
         debug_server_config
 
+        debug('Creating EC2 Instance..')
         connection.servers.create(
-          :availability_zone         => config[:availability_zone],
-          :security_group_ids        => config[:security_group_ids],
-          :tags                      => config[:tags],
-          :flavor_id                 => config[:flavor_id],
-          :ebs_optimized             => config[:ebs_optimized],
-          :image_id                  => config[:image_id],
-          :key_name                  => config[:aws_ssh_key_id],
-          :subnet_id                 => config[:subnet_id],
-          :iam_instance_profile_name => config[:iam_profile_name],
-          :user_data                 => winrm_config
+        :availability_zone         => config[:availability_zone],
+        :security_group_ids        => config[:security_group_ids],
+        :tags                      => config[:tags],
+        :flavor_id                 => config[:flavor_id],
+        :ebs_optimized             => config[:ebs_optimized],
+        :image_id                  => config[:image_id],
+        :key_name                  => config[:aws_ssh_key_id],
+        :subnet_id                 => config[:subnet_id],
+        :iam_instance_profile_name => config[:iam_profile_name],
+        :user_data                 => prepared_user_data
         )
       end
 
-      def winrm_config
-        return if config[:password].nil?
-        <<-EOH.gsub(/^ {10}/, '')
-        <powershell>
-          $username="#{config[:username]}"
-          $password="#{config[:password]}"
+      # Method for preparing user_data for enabling PS Remoting if the selected
+      # transport method is WinRM
 
-          $seccfg = [IO.Path]::GetTempFileName()
-          secedit /export /cfg $seccfg
-          (Get-Content $seccfg) | Foreach-Object {$_ -replace "PasswordComplexity\\s*=\\s*1", "PasswordComplexity=0"} | Set-Content $seccfg
-          secedit /configure /db $env:windir\\security\\new.sdb /cfg $seccfg /areas SECURITYPOLICY
-          del $seccfg
-           
-          net user /add $username $password;
-          net localgroup Administrators /add $username;
+      def prepared_user_data
+        if transport.name.casecmp('winrm') == 0
+          debug("Injecting WinRM config to EC2 user_data")
 
-          try { winrm quickconfig -q }
-          catch {write-host "winrm quickconfig failed"}
-          winrm set winrm/config '@{MaxTimeoutms="1800000"}'
-          winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="512"}'
-          winrm set winrm/config/winrs '@{MaxShellsPerUser="50"}'
-          winrm set winrm/config/service '@{AllowUnencrypted="true"}'
-          winrm set winrm/config/service/auth '@{Basic="true"}'
-          netsh advfirewall firewall set rule name="Windows Remote Management (HTTP-In)" profile=public protocol=tcp localport=5985 remoteip=localsubnet new remoteip=any
+          #Preparing custom static admin user if we defined something other than Administrator
+          customAdminScript = ''
+          if config[:username].casecmp('Administrator') != 0
+            debug('Injecting custom Local Administrator:')
+            debug("username '#{config[:username]}'")
+            debug("password '#{config[:password]}'")
 
-        </powershell>
-        EOH
+            customAdminScript = <<-EOH.gsub(/^ {10}/, '')
+            "Disabling Complex Passwords" >> $logfile
+            $seccfg = [IO.Path]::GetTempFileName()
+            & secedit.exe /export /cfg $seccfg >> $logfile
+            (Get-Content $seccfg) | Foreach-Object {$_ -replace "PasswordComplexity\\s*=\\s*1", "PasswordComplexity = 0"} | Set-Content $seccfg
+            & secedit.exe /configure /db $env:windir\\security\\new.sdb /cfg $seccfg /areas SECURITYPOLICY >> $logfile
+            & cp $seccfg "c:\\"
+            & del $seccfg
+
+            $username="#{config[:username]}"
+            $password="#{config[:password]}"
+
+            "Creating static user: $username" >> $logfile
+            & net.exe user /y /add $username $password >> $logfile
+
+            "Adding $username to Administrators" >> $logfile
+            & net.exe localgroup Administrators /add $username >> $logfile
+
+            EOH
+          end
+
+          # Returning the fully constructed PowerShell script to user_data
+          return <<-EOH.gsub(/^ {10}/, '')
+          <powershell>
+          $logfile="C:\\Program Files\\Amazon\\Ec2ConfigService\\Logs\\kitchen-ec2.log"
+
+          #PS Remoting and & winrm.cmd basic config
+          Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          & winrm.cmd quickconfig -q >> $logfile
+          & winrm.cmd set winrm/config '@{MaxTimeoutms="1800000"}' >> $logfile
+          & winrm.cmd set winrm/config/winrs '@{MaxMemoryPerShellMB="512"}' >> $logfile
+          & winrm.cmd set winrm/config/winrs '@{MaxShellsPerUser="50"}' >> $logfile
+
+          #Client settings
+          & winrm.cmd set winrm/config/client/auth '@{Basic="true"}' >> $logfile
+
+          #Server settings
+          & winrm.cmd set winrm/config/service/auth '@{Basic="true"}' >> $logfile
+          & winrm.cmd set winrm/config/service '@{AllowUnencrypted="true"}' >> $logfile
+          & winrm.cmd set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}' >> $logfile
+
+          #Firewall Config
+          & netsh.exe advfirewall set publicprofile state off  >> $logfile
+          & netsh advfirewall firewall set rule name="Windows Remote Management (HTTP-In)" profile=public protocol=tcp localport=5985 remoteip=localsubnet new remoteip=any  >> $logfile
+
+          #{customAdminScript}
+
+          #{config[:user_data]}
+
+          </powershell>
+          EOH
+        else
+          return config[:user_data] if !config[:user_data].nil?
+        end
+        return ''
       end
 
+      # Helper method to check whether Amazon reported a server Ready
+      def windows_ready? state
+        log = connection.get_console_output(state[:server_id]).data[:body]["output"]
+        if !log.nil?
+          debug("Console output: --- \n")
+          debug(log)
+        end
+        !log.nil? and log =~ /Windows is Ready to use/
+      end
+
+      # Helper method to fetch and decrypt Windows password from EC2
+      def windows_password state
+        enc = connection.get_password_data(state[:server_id]).data[:body]["passwordData"].strip!
+        enc = Base64.decode64(enc)
+        rsa = OpenSSL::PKey::RSA.new File.read config[:ssh_key]
+        rsa.private_decrypt(enc) if !enc.nil? and enc != ''
+      rescue NoMethodError
+        debug('Unable to fetch encrypted password')
+        return ''
+      rescue TypeError
+        debug('Unable to decrypt password with SSH_KEY')
+        return ''
+      end
+
+      # Debug helper to display applied configuration
       def debug_server_config
+        debug('EC2 Server Configuration')
         debug("ec2:region '#{config[:region]}'")
         debug("ec2:availability_zone '#{config[:availability_zone]}'")
         debug("ec2:flavor_id '#{config[:flavor_id]}'")
@@ -186,17 +283,22 @@ module Kitchen
         debug("ec2:key_name '#{config[:aws_ssh_key_id]}'")
         debug("ec2:subnet_id '#{config[:subnet_id]}'")
         debug("ec2:iam_profile_name '#{config[:iam_profile_name]}'")
-        debug("ec2:user_data '#{winrm_config}'")
+        debug("ec2:username '#{config[:username]}'")
+        debug("ec2:password '#{config[:password]}'")
+        debug("ec2:user_data '#{config[:user_data]}'")
+
       end
 
+      # Helper method for reading the Region-OS-AMI-UserName mapings to memory
       def amis
         @amis ||= begin
           json_file = File.join(File.dirname(__FILE__),
-            %w{.. .. .. data amis.json})
+          %w{.. .. .. data amis.json})
           JSON.load(IO.read(json_file))
         end
       end
 
+      # Networking helper
       def interface_types
         {
           'dns' => 'dns_name',
@@ -205,6 +307,7 @@ module Kitchen
         }
       end
 
+      # Helper to get the hostname for the instance
       def hostname(server)
         if config[:interface]
           method = interface_types.fetch(config[:interface]) do
