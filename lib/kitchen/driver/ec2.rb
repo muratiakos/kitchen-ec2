@@ -260,13 +260,13 @@ module Kitchen
       def windows_password state
         enc = connection.get_password_data(state[:server_id]).data[:body]["passwordData"].strip!
         enc = Base64.decode64(enc)
-        rsa = OpenSSL::PKey::RSA.new File.read config[:ssh_key]
+        rsa = OpenSSL::PKey::RSA.new aws_private_key
         rsa.private_decrypt(enc) if !enc.nil? and enc != ''
       rescue NoMethodError
         debug('Unable to fetch encrypted password')
         return ''
       rescue TypeError
-        debug('Unable to decrypt password with SSH_KEY')
+        debug('Unable to decrypt password with AWS_PRIVATE_KEY')
         return ''
       end
 
@@ -308,6 +308,7 @@ module Kitchen
       end
 
       # Helper to get the hostname for the instance
+
       def hostname(server)
         if config[:interface]
           method = interface_types.fetch(config[:interface]) do
@@ -318,6 +319,16 @@ module Kitchen
           server.dns_name || server.public_ip_address || server.private_ip_address
         end
       end
+
+      # Get AWS Private Key
+      def aws_private_key
+        begin
+          ENV['AWS_PRIVATE_KEY'] || ENV['AWS_SSH_KEY'] || (File.read config[:ssh_key])
+        rescue
+          debug('SSH_KEY_RAW and SSH_KEY is not set.')
+        end
+      end
+
     end
   end
 end
