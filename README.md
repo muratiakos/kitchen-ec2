@@ -236,7 +236,7 @@ platforms:
     transport:
       name: winrm
   - name: windows-2008R2
-    ransport:
+    transport:
       name: winrm
       max_threads: 4
 
