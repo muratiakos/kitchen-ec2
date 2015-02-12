@@ -32,7 +32,7 @@ module Kitchen
     class Ec2 < Kitchen::Driver::Base
 
       default_config :region,             'us-east-1'
-      default_config :availability_zone,  'us-east-1b'
+      default_config :availability_zone,  nil
       default_config :flavor_id,          'm1.small'
       default_config :ebs_optimized,      false
       default_config :security_group_ids, ['default']
@@ -325,7 +325,7 @@ module Kitchen
         begin
           ENV['AWS_PRIVATE_KEY'] || ENV['AWS_SSH_KEY'] || (File.read config[:ssh_key])
         rescue
-          debug('SSH_KEY_RAW and SSH_KEY is not set.')
+          debug('AWS_PRIVATE_KEY and AWS_SSH_KEY environment variables are not set.')
         end
       end
 

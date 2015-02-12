@@ -1,3 +1,7 @@
+## 0.9.3 / 2015-02-13
+### Bug fixes
+* Removing default availability-zone to let Amazon defaults to be applied for new instances
+
 ## 0.9.2 / 2015-01-27
 ### New features
 * Adding support for AWS Private Key Pair from TeamCity through AWS_PRIVATE_KEY Environment variable
